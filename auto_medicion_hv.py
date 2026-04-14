@@ -381,14 +381,33 @@ def draw_overlay(img_bgr: np.ndarray, meta: list, phal: list,
 
 def analyze_single(img_bgr: np.ndarray, label: str = "Pie",
                    min_elongation: float = 2.5) -> dict:
-    """Analiza un único pie recortado."""
-    gray  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    """
+    Analiza un único pie recortado.
+
+    Recorte al ANTEPIÉ (70 % superior):
+      Los ángulos AHV y AIM solo necesitan metatarsianos y falanges.
+      El calcáneo, tarsales y tobillo están en el tercio inferior y
+      generaban falsos positivos que confundían al clasificador.
+      Analizamos solo el 70 % superior y dibujamos sobre la imagen completa.
+    """
+    h, w = img_bgr.shape[:2]
+
+    # ── Limitar al antepié ────────────────────────────────────
+    forefoot_h  = int(h * 0.70)
+    forefoot    = img_bgr[:forefoot_h, :]
+
+    gray  = cv2.cvtColor(forefoot, cv2.COLOR_BGR2GRAY)
     proc  = preprocess(gray)
     mask  = segment(proc)
     bones = extract_bones(mask, min_elong=min_elongation)
-    meta, phal = classify_bones(bones, foot_label=label)   # pasa lateralidad
+    meta, phal = classify_bones(bones, foot_label=label)
     meas  = measure_angles(meta, phal)
-    img_r = draw_overlay(img_bgr, meta, phal, meas, label)
+
+    # Dibujar sobre el recorte del antepié y reincrustar en la imagen completa
+    forefoot_ann = draw_overlay(forefoot, meta, phal, meas, label)
+    img_r = img_bgr.copy()
+    img_r[:forefoot_h, :] = forefoot_ann
+
     return {
         "label":        label,
         "measurements": meas,
