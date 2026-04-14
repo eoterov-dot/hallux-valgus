@@ -139,8 +139,8 @@ def detect_and_split_feet(img_bgr: np.ndarray, pad: int = 25):
 # ══════════════════════════════════════════════════════════════
 
 def preprocess(gray: np.ndarray) -> np.ndarray:
-    norm    = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-    clahe   = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    norm     = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+    clahe    = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(norm)
     return cv2.fastNlMeansDenoising(enhanced, h=10)
 
@@ -186,25 +186,41 @@ def pca_axis(pts: np.ndarray):
     return mean, vecs[:, 0], elong, vals
 
 
-def extract_bones(mask: np.ndarray, min_area_frac=0.0005, min_elong=2.0):
+def extract_bones(mask: np.ndarray, min_area_frac=0.004, min_elong=3.5):
+    """
+    Detecta estructuras óseas con tres filtros clave:
+    1. Área mínima estricta  → elimina fragmentos pequeños y letras
+    2. Elongación alta       → solo huesos largos tipo metatarsiano/falange
+    3. Filtro de orientación → rechaza estructuras horizontales (texto de la placa)
+       En AP dorsoplantar los huesos del pie son casi verticales.
+    """
     h, w = mask.shape
-    min_area = int(w * h * min_area_frac)
+    min_area = int(w * h * min_area_frac)   # ≥ 0.4 % del área total
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
     bones = []
 
     for i in range(1, n):
         area = stats[i, cv2.CC_STAT_AREA]
         if area < min_area: continue
+
         bw = stats[i, cv2.CC_STAT_WIDTH]
         bh = stats[i, cv2.CC_STAT_HEIGHT]
-        if max(bw, bh) / (min(bw, bh) + 1) < 1.5: continue
+        if max(bw, bh) / (min(bw, bh) + 1) < 2.5: continue
 
         ys, xs = np.where(labels == i)
         pts = np.stack([xs, ys], axis=1).astype(np.float64)
-        if len(pts) < 20: continue
+        if len(pts) < 80: continue
 
         center, axis, elong, vals = pca_axis(pts)
         if elong < min_elong: continue
+
+        # ── FILTRO DE ORIENTACIÓN ──────────────────────────────
+        # axis[0] = componente X  |  axis[1] = componente Y
+        # Hueso casi vertical → |axis[0]| pequeño (< 0.65 ≈ dentro de 40° de vertical)
+        # Texto/marcadores ("MARTINEZ FERNANDEZ", "D", "EN CARGA") → casi horizontal
+        #   → |axis[0]| grande (≥ 0.65) → RECHAZAR
+        if abs(axis[0]) >= 0.65:
+            continue
 
         proj   = (pts - center) @ axis
         length = float(proj.max() - proj.min())
@@ -215,16 +231,55 @@ def extract_bones(mask: np.ndarray, min_area_frac=0.0005, min_elong=2.0):
             "area": int(area), "label": "",
         })
 
+    # Quedarse con las 8 estructuras más largas (evitar fragmentos residuales)
+    bones = sorted(bones, key=lambda b: b["length"], reverse=True)[:8]
     return bones
 
 
-def classify_bones(bones: list):
+def classify_bones(bones: list, foot_label: str = ""):
+    """
+    Clasifica metatarsianos vs falanges usando posición Y (proximal/distal)
+    y longitud relativa.  También ordena medial→lateral correctamente según
+    si es pie derecho (hallux a la izquierda de la imagen) o izquierdo
+    (hallux a la derecha).
+    """
     if len(bones) < 2:
         return [], []
-    lengths = np.array([b["length"] for b in bones])
-    thresh  = np.percentile(lengths, 35)
-    meta = sorted([b for b in bones if b["length"] >= thresh], key=lambda b: b["center"][0])
-    phal = sorted([b for b in bones if b["length"] <  thresh], key=lambda b: b["center"][0])
+
+    # En AP dorsoplantar: falanges están MÁS ARRIBA (menor y = más distal)
+    #                     metatarsianos están MÁS ABAJO (mayor y = más proximal)
+    y_vals  = np.array([b["center"][1] for b in bones])
+    y_split = np.percentile(y_vals, 45)   # punto de corte proximal/distal
+
+    lengths    = np.array([b["length"] for b in bones])
+    len_median = np.median(lengths)
+
+    meta, phal = [], []
+    for b in bones:
+        long  = b["length"] >= len_median * 0.80
+        lower = b["center"][1] >= y_split
+        if long and lower:
+            meta.append(b)
+        elif not long and not lower:
+            phal.append(b)
+        elif long:
+            meta.append(b)   # largo pero superior → base metatarsiano
+        else:
+            phal.append(b)   # corto inferior → falange de radio menor
+
+    # Si no hay falanges, las más distales de los candidatos las asignamos
+    if not phal and meta:
+        meta_by_y = sorted(meta, key=lambda b: b["center"][1])
+        phal = meta_by_y[:1]
+        meta = meta_by_y[1:]
+
+    # Ordenar medial → lateral
+    # Pie DERECHO: hallux a la IZQUIERDA de la imagen → orden creciente de x
+    # Pie IZQUIERDO: hallux a la DERECHA de la imagen → orden decreciente de x
+    reverse = "Izquierdo" in foot_label or "(I)" in foot_label
+    meta = sorted(meta, key=lambda b: b["center"][0], reverse=reverse)
+    phal = sorted(phal, key=lambda b: b["center"][0], reverse=reverse)
+
     for i, b in enumerate(meta): b["label"] = f"MT{i+1}"
     for i, b in enumerate(phal): b["label"] = f"PF{i+1}"
     return meta, phal
@@ -323,13 +378,13 @@ def draw_overlay(img_bgr: np.ndarray, meta: list, phal: list,
 # ══════════════════════════════════════════════════════════════
 
 def analyze_single(img_bgr: np.ndarray, label: str = "Pie",
-                   min_elongation: float = 2.0) -> dict:
+                   min_elongation: float = 3.5) -> dict:
     """Analiza un único pie recortado."""
     gray  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     proc  = preprocess(gray)
     mask  = segment(proc)
     bones = extract_bones(mask, min_elong=min_elongation)
-    meta, phal = classify_bones(bones)
+    meta, phal = classify_bones(bones, foot_label=label)   # pasa lateralidad
     meas  = measure_angles(meta, phal)
     img_r = draw_overlay(img_bgr, meta, phal, meas, label)
     return {
@@ -439,8 +494,8 @@ def main():
         st.markdown("---")
         min_elong = st.slider(
             "Elongación mínima de hueso",
-            min_value=1.5, max_value=5.0, value=2.0, step=0.1,
-            help="Aumenta si detecta ruido; reduce si no encuentra huesos.",
+            min_value=1.5, max_value=6.0, value=3.5, step=0.1,
+            help="3.5 recomendado para AP estándar. Reduce si no detecta huesos.",
         )
         st.markdown("---")
         st.markdown("### 📋 Rangos normales")
