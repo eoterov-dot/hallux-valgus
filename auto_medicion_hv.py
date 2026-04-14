@@ -240,47 +240,41 @@ def extract_bones(mask: np.ndarray, min_area_frac=0.001, min_elong=2.5):
 
 def classify_bones(bones: list, foot_label: str = ""):
     """
-    Clasifica metatarsianos vs falanges usando posición Y (proximal/distal)
-    y longitud relativa.  También ordena medial→lateral correctamente según
-    si es pie derecho (hallux a la izquierda de la imagen) o izquierdo
-    (hallux a la derecha).
+    Clasificación anatómica de los huesos del antepié.
+
+    Regla 1 — Metatarsianos:
+      Hay EXACTAMENTE 5 metatarsianos. Se toman los 5 de mayor longitud.
+      (Esto evita confundir la falange proximal larga del HV severo con un MT.)
+
+    Regla 2 — Falanges:
+      El resto de candidatos que estén MÁS DISTALES que el promedio de los MTs
+      (es decir, con y < promedio_y de los MTs) se clasifican como falanges.
+
+    Regla 3 — Orden medial→lateral:
+      Pie D: MT1 = más a la IZQUIERDA de la imagen (x mínimo)
+      Pie I: MT1 = más a la DERECHA de la imagen (x máximo)
     """
     if len(bones) < 2:
         return [], []
 
-    # En AP dorsoplantar: falanges están MÁS ARRIBA (menor y = más distal)
-    #                     metatarsianos están MÁS ABAJO (mayor y = más proximal)
-    y_vals  = np.array([b["center"][1] for b in bones])
-    y_split = np.percentile(y_vals, 45)   # punto de corte proximal/distal
+    # ── Regla 1: los 5 más largos son metatarsianos ──────────
+    bones_by_len = sorted(bones, key=lambda b: b["length"], reverse=True)
+    n_meta       = min(5, len(bones_by_len))
+    meta_raw     = bones_by_len[:n_meta]
+    phal_raw     = bones_by_len[n_meta:]
 
-    lengths    = np.array([b["length"] for b in bones])
-    len_median = np.median(lengths)
+    # ── Regla 2: falanges deben estar MÁS ARRIBA que los MTs ─
+    # (menor y = más distal = zona de los dedos)
+    if meta_raw:
+        meta_y_mean = float(np.mean([b["center"][1] for b in meta_raw]))
+        phal = [b for b in phal_raw if b["center"][1] < meta_y_mean]
+    else:
+        phal = phal_raw
 
-    meta, phal = [], []
-    for b in bones:
-        long  = b["length"] >= len_median * 0.80
-        lower = b["center"][1] >= y_split
-        if long and lower:
-            meta.append(b)
-        elif not long and not lower:
-            phal.append(b)
-        elif long:
-            meta.append(b)   # largo pero superior → base metatarsiano
-        else:
-            phal.append(b)   # corto inferior → falange de radio menor
-
-    # Si no hay falanges, las más distales de los candidatos las asignamos
-    if not phal and meta:
-        meta_by_y = sorted(meta, key=lambda b: b["center"][1])
-        phal = meta_by_y[:1]
-        meta = meta_by_y[1:]
-
-    # Ordenar medial → lateral
-    # Pie DERECHO: hallux a la IZQUIERDA de la imagen → orden creciente de x
-    # Pie IZQUIERDO: hallux a la DERECHA de la imagen → orden decreciente de x
+    # ── Regla 3: orden medial→lateral ───────────────────────
     reverse = "Izquierdo" in foot_label or "(I)" in foot_label
-    meta = sorted(meta, key=lambda b: b["center"][0], reverse=reverse)
-    phal = sorted(phal, key=lambda b: b["center"][0], reverse=reverse)
+    meta = sorted(meta_raw, key=lambda b: b["center"][0], reverse=reverse)
+    phal = sorted(phal,     key=lambda b: b["center"][0], reverse=reverse)
 
     for i, b in enumerate(meta): b["label"] = f"MT{i+1}"
     for i, b in enumerate(phal): b["label"] = f"PF{i+1}"
@@ -301,24 +295,35 @@ def confidence_score(b1, b2) -> float:
 
 def measure_angles(meta: list, phal: list) -> dict:
     results = {}
+
     if len(meta) >= 1 and len(phal) >= 1:
+        mt1 = meta[0]
+        # PF para AHV = falange con x más cercana a MT1
+        # (la falange del hallux siempre está en la misma columna que MT1)
+        pf1 = min(phal, key=lambda p: abs(p["center"][0] - mt1["center"][0]))
         results["AHV"] = {
-            "angle": angle_between(meta[0]["axis"], phal[0]["axis"]),
-            "bone1": meta[0], "bone2": phal[0],
-            "confidence": confidence_score(meta[0], phal[0]),
+            "angle":      angle_between(mt1["axis"], pf1["axis"]),
+            "bone1":      mt1,
+            "bone2":      pf1,
+            "confidence": confidence_score(mt1, pf1),
         }
+
     if len(meta) >= 2:
         results["AIM12"] = {
-            "angle": angle_between(meta[0]["axis"], meta[1]["axis"]),
-            "bone1": meta[0], "bone2": meta[1],
+            "angle":      angle_between(meta[0]["axis"], meta[1]["axis"]),
+            "bone1":      meta[0],
+            "bone2":      meta[1],
             "confidence": confidence_score(meta[0], meta[1]),
         }
+
     if len(meta) >= 5:
         results["AIM25"] = {
-            "angle": angle_between(meta[1]["axis"], meta[4]["axis"]),
-            "bone1": meta[1], "bone2": meta[4],
+            "angle":      angle_between(meta[1]["axis"], meta[4]["axis"]),
+            "bone1":      meta[1],
+            "bone2":      meta[4],
             "confidence": confidence_score(meta[1], meta[4]),
         }
+
     return results
 
 
