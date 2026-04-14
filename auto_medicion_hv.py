@@ -186,16 +186,19 @@ def pca_axis(pts: np.ndarray):
     return mean, vecs[:, 0], elong, vals
 
 
-def extract_bones(mask: np.ndarray, min_area_frac=0.004, min_elong=3.5):
+def extract_bones(mask: np.ndarray, min_area_frac=0.001, min_elong=2.5):
     """
-    Detecta estructuras óseas con tres filtros clave:
-    1. Área mínima estricta  → elimina fragmentos pequeños y letras
-    2. Elongación alta       → solo huesos largos tipo metatarsiano/falange
-    3. Filtro de orientación → rechaza estructuras horizontales (texto de la placa)
-       En AP dorsoplantar los huesos del pie son casi verticales.
+    Detecta estructuras óseas elongadas con tres filtros calibrados:
+
+    1. Área ≥ 0.1% imagen  → elimina caracteres de texto sueltos.
+    2. Elongación ≥ 2.5    → solo estructuras alargadas tipo hueso.
+    3. Orientación suave   → |axis_x| < 0.82 rechaza solo lo que es
+       casi perfectamente horizontal (texto de cabecera de placa).
+       Acepta huesos hasta ~55° desde la vertical, cubriendo incluso
+       falanges muy desviadas en Hallux Valgus severo (40-50°).
     """
     h, w = mask.shape
-    min_area = int(w * h * min_area_frac)   # ≥ 0.4 % del área total
+    min_area = int(w * h * min_area_frac)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
     bones = []
 
@@ -205,21 +208,20 @@ def extract_bones(mask: np.ndarray, min_area_frac=0.004, min_elong=3.5):
 
         bw = stats[i, cv2.CC_STAT_WIDTH]
         bh = stats[i, cv2.CC_STAT_HEIGHT]
-        if max(bw, bh) / (min(bw, bh) + 1) < 2.5: continue
+        # Umbral bajo (1.2) porque un hueso inclinado 45° tiene bbox cuadrado
+        # aunque su elongación real sea alta. La elongación PCA filtra mejor.
+        if max(bw, bh) / (min(bw, bh) + 1) < 1.2: continue
 
         ys, xs = np.where(labels == i)
         pts = np.stack([xs, ys], axis=1).astype(np.float64)
-        if len(pts) < 80: continue
+        if len(pts) < 40: continue
 
         center, axis, elong, vals = pca_axis(pts)
         if elong < min_elong: continue
 
-        # ── FILTRO DE ORIENTACIÓN ──────────────────────────────
-        # axis[0] = componente X  |  axis[1] = componente Y
-        # Hueso casi vertical → |axis[0]| pequeño (< 0.65 ≈ dentro de 40° de vertical)
-        # Texto/marcadores ("MARTINEZ FERNANDEZ", "D", "EN CARGA") → casi horizontal
-        #   → |axis[0]| grande (≥ 0.65) → RECHAZAR
-        if abs(axis[0]) >= 0.65:
+        # Rechaza solo estructuras casi puramente horizontales (texto cabecera).
+        # Umbral 0.82 = permite ángulos hasta ~55° desde la vertical.
+        if abs(axis[0]) >= 0.82:
             continue
 
         proj   = (pts - center) @ axis
@@ -231,8 +233,8 @@ def extract_bones(mask: np.ndarray, min_area_frac=0.004, min_elong=3.5):
             "area": int(area), "label": "",
         })
 
-    # Quedarse con las 8 estructuras más largas (evitar fragmentos residuales)
-    bones = sorted(bones, key=lambda b: b["length"], reverse=True)[:8]
+    # Top 9 por longitud para evitar fragmentos residuales
+    bones = sorted(bones, key=lambda b: b["length"], reverse=True)[:9]
     return bones
 
 
@@ -378,7 +380,7 @@ def draw_overlay(img_bgr: np.ndarray, meta: list, phal: list,
 # ══════════════════════════════════════════════════════════════
 
 def analyze_single(img_bgr: np.ndarray, label: str = "Pie",
-                   min_elongation: float = 3.5) -> dict:
+                   min_elongation: float = 2.5) -> dict:
     """Analiza un único pie recortado."""
     gray  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     proc  = preprocess(gray)
@@ -494,8 +496,8 @@ def main():
         st.markdown("---")
         min_elong = st.slider(
             "Elongación mínima de hueso",
-            min_value=1.5, max_value=6.0, value=3.5, step=0.1,
-            help="3.5 recomendado para AP estándar. Reduce si no detecta huesos.",
+            min_value=1.5, max_value=6.0, value=2.5, step=0.1,
+            help="2.5 recomendado. Sube si detecta ruido; baja si no encuentra huesos.",
         )
         st.markdown("---")
         st.markdown("### 📋 Rangos normales")
