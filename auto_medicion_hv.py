@@ -1,57 +1,173 @@
 #!/usr/bin/env python3
 """
-Medición Automática de Ángulos — Hallux Valgus
-Versión con interfaz web Streamlit
-
-Soporta:
-  · Imágenes con un solo pie
-  · Imágenes bilaterales (dos pies en la misma placa)
-  · Modo lote: procesa múltiples radiografías a la vez
+Medición de Ángulos — Hallux Valgus
+Herramienta semi-asistida: 6 clics por pie → AHV y AIM 1-2 automáticos
+Incluye repositorio de pacientes (RUT) descargable en CSV y Excel.
 
 Uso:
     streamlit run auto_medicion_hv.py
 
 Requiere:
-    pip install streamlit opencv-python-headless numpy Pillow pandas
+    pip install streamlit streamlit-image-coordinates \
+                opencv-python-headless numpy Pillow pandas openpyxl
 """
 
 import streamlit as st
 import cv2
 import numpy as np
-from PIL import Image
-import json
+from PIL import Image, ImageDraw
 import pandas as pd
-from datetime import datetime
-import io
-import zipfile
+from datetime import datetime, date
+import io, os, base64
+
+try:
+    from streamlit_image_coordinates import streamlit_image_coordinates
+    COORDS_OK = True
+except ImportError:
+    COORDS_OK = False
+
+try:
+    import pytesseract
+    OCR_OK = True
+except ImportError:
+    OCR_OK = False
+
+# ══════════════════════════════════════════════════════════════
+# OCR — EXTRACCIÓN DE DATOS DESDE LA RADIOGRAFÍA
+# ══════════════════════════════════════════════════════════════
+
+def preprocess_for_ocr(pil_gray_crop: Image.Image) -> np.ndarray:
+    """
+    Preprocesa un recorte de la imagen para maximizar la legibilidad en Tesseract.
+    Maneja tanto texto blanco sobre negro (radiografías) como negro sobre blanco.
+    """
+    arr = np.array(pil_gray_crop)
+
+    # Invertir si el fondo es oscuro (texto blanco sobre negro)
+    if arr.mean() < 128:
+        arr = 255 - arr
+
+    # Mejorar contraste local con CLAHE
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    arr   = clahe.apply(arr)
+
+    # Escalar × 3 — Tesseract rinde mejor con fuentes grandes
+    arr = cv2.resize(arr, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+
+    # Desenfoque leve para eliminar ruido de píxeles
+    arr = cv2.GaussianBlur(arr, (3, 3), 0)
+
+    # Umbral de Otsu: binarización adaptativa sin parámetros manuales
+    _, arr = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    return arr
+
+
+def ocr_patient_info(img_pil: Image.Image):
+    """
+    Extrae nombre y RUT/ID del texto DICOM superpuesto en la radiografía.
+    Busca en la esquina superior izquierda y superior derecha, que es donde
+    los sistemas PACS/DICOM ubican los datos del paciente.
+    Devuelve (nombre, rut) — puede ser (None, None) si no hay datos legibles.
+    """
+    if not OCR_OK:
+        return None, None
+
+    import re
+    w, h = img_pil.size
+    gray = img_pil.convert("L")
+
+    # Cuatro zonas de búsqueda: izquierda arriba, derecha arriba,
+    # banda completa superior e inferior
+    crops = [
+        gray.crop((0,          0,        w // 2,      int(h * 0.15))),  # sup izq
+        gray.crop((w // 2,     0,        w,           int(h * 0.15))),  # sup der
+        gray.crop((0,          0,        w,           int(h * 0.15))),  # sup completo
+        gray.crop((0,          int(h * 0.88), w,      h)),              # inf completo
+    ]
+
+    all_text = ""
+    for crop in crops:
+        arr = preprocess_for_ocr(crop)
+        for psm in [6, 4, 11]:   # distintos modos de segmentación de Tesseract
+            try:
+                txt = pytesseract.image_to_string(
+                    arr,
+                    config=f"--psm {psm} --oem 3 -c tessedit_char_whitelist="
+                           r"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+                           r"0123456789^-. /",
+                )
+                all_text += "\n" + txt
+            except Exception:
+                pass
+
+    nombre, rut = None, None
+
+    for line in all_text.split("\n"):
+        line = line.strip()
+        if not line or len(line) < 3:
+            continue
+
+        # ── Nombre: formato DICOM "APELLIDO^NOMBRE" ──────────
+        if "^" in line and not nombre:
+            parts = line.split("^", 1)
+            ap   = parts[0].strip()
+            nom  = parts[1].strip() if len(parts) > 1 else ""
+            candidate = f"{ap} {nom}".strip()
+            if len(candidate) >= 6 and re.search(r"[A-Z]{3,}", candidate):
+                nombre = candidate[:80]
+
+        # ── RUT chileno con puntos: 12.345.678-9 ─────────────
+        if not rut:
+            m = re.search(r"\b(\d{1,2}\.\d{3}\.\d{3}[-][\dkK])\b", line)
+            if m:
+                rut = m.group(1)
+
+        # ── RUT / ID sin puntos: 12345678-9 ──────────────────
+        if not rut:
+            m = re.search(r"\b(\d{6,8}[-][\dkK])\b", line)
+            if m:
+                rut = m.group(1)
+
+        if nombre and rut:
+            break
+
+    return nombre, rut
+
 
 # ══════════════════════════════════════════════════════════════
 # CONSTANTES CLÍNICAS
 # ══════════════════════════════════════════════════════════════
 
 ANGLE_INFO = {
-    "AHV": {
-        "name":     "Ángulo de Hallux Valgus",
-        "desc":     "Eje 1er metatarsiano / Eje falange proximal",
-        "normal":   15, "mild": 20, "moderate": 40,
-        "color_bgr": (100, 120, 248), "color_hex": "#f87171",
-    },
-    "AIM12": {
-        "name":     "Ángulo Intermetatarsiano 1-2",
-        "desc":     "Eje 1er metatarsiano / Eje 2do metatarsiano",
-        "normal":   9,  "mild": 11, "moderate": 16,
-        "color_bgr": (80, 211, 130), "color_hex": "#34d399",
-    },
-    "AIM25": {
-        "name":     "Ángulo Intermetatarsiano 2-5",
-        "desc":     "Eje 2do metatarsiano / Eje 5to metatarsiano",
-        "normal":   20, "mild": 25, "moderate": 35,
-        "color_bgr": (251, 150, 80), "color_hex": "#fb923c",
-    },
+    "AHV":   {"name": "Ángulo de Hallux Valgus",        "normal": 15, "mild": 20, "moderate": 40, "color": "#f87171"},
+    "AIM12": {"name": "Ángulo Intermetatarsiano 1-2",   "normal":  9, "mild": 11, "moderate": 16, "color": "#34d399"},
 }
 
-def get_severity(angle, info):
-    if info.get("normal") is None:
+# Definición de los 6 puntos que el médico debe marcar
+CLICK_STEPS = [
+    {"idx": 0, "bone": "MT1", "color": "#f87171", "desc": "MT1 — punto PROXIMAL del 1er metatarsiano (inicio de la diáfisis)"},
+    {"idx": 1, "bone": "MT1", "color": "#f87171", "desc": "MT1 — punto DISTAL del 1er metatarsiano (hacia la cabeza)"},
+    {"idx": 2, "bone": "MT2", "color": "#34d399", "desc": "MT2 — punto PROXIMAL del 2do metatarsiano"},
+    {"idx": 3, "bone": "MT2", "color": "#34d399", "desc": "MT2 — punto DISTAL del 2do metatarsiano"},
+    {"idx": 4, "bone": "PF1", "color": "#60a5fa", "desc": "PF1 — BASE de la falange proximal del hallux (articulación MTF)"},
+    {"idx": 5, "bone": "PF1", "color": "#60a5fa", "desc": "PF1 — EXTREMO DISTAL de la falange proximal del hallux"},
+]
+
+REPO_COLS = ["RUT", "Nombre", "Fecha", "Lateralidad", "Operado", "Pie",
+             "AHV (°)", "AHV Clasificación",
+             "AIM 1-2 (°)", "AIM 1-2 Clasificación", "Notas"]
+
+REPO_FILE = "repositorio_hv.csv"
+
+
+# ══════════════════════════════════════════════════════════════
+# CÁLCULO DE ÁNGULOS
+# ══════════════════════════════════════════════════════════════
+
+def get_severity(angle, key):
+    info = ANGLE_INFO.get(key, {})
+    if angle is None or info.get("normal") is None:
         return "N/A", "#8b949e"
     if angle <= info["normal"]:    return "Normal",   "#56d364"
     if angle <= info["mild"]:      return "Leve",     "#f0a030"
@@ -59,474 +175,309 @@ def get_severity(angle, info):
     return "Severo", "#f87171"
 
 
+def calc_angle(p1, p2, p3, p4):
+    """
+    Ángulo agudo entre dos líneas:
+      Línea 1: p1 → p2
+      Línea 2: p3 → p4
+    """
+    v1 = np.array([p2[0]-p1[0], p2[1]-p1[1]], dtype=float)
+    v2 = np.array([p4[0]-p3[0], p4[1]-p3[1]], dtype=float)
+    m1, m2 = np.linalg.norm(v1), np.linalg.norm(v2)
+    if m1 < 1 or m2 < 1:
+        return None
+    cos_a = float(np.clip(abs(np.dot(v1, v2) / (m1 * m2)), 0.0, 1.0))
+    angle = np.degrees(np.arccos(cos_a))
+    return round(min(angle, 180.0 - angle), 1)
+
+
 # ══════════════════════════════════════════════════════════════
-# DETECCIÓN Y SEPARACIÓN DE PIES  ← NUEVO
+# SEPARACIÓN BILATERAL
 # ══════════════════════════════════════════════════════════════
 
-def crop_to_content(img: np.ndarray, pad: int = 30) -> np.ndarray:
-    """Recorta la imagen al contenido no-negro más un margen."""
+def crop_to_content(img, pad=25):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
-    _, thresh = cv2.threshold(gray, 12, 255, cv2.THRESH_BINARY)
-    coords = cv2.findNonZero(thresh)
+    _, th = cv2.threshold(gray, 12, 255, cv2.THRESH_BINARY)
+    coords = cv2.findNonZero(th)
     if coords is None:
         return img
     x, y, w, h = cv2.boundingRect(coords)
-    h_img, w_img = img.shape[:2]
-    x1 = max(0, x - pad)
-    y1 = max(0, y - pad)
-    x2 = min(w_img, x + w + pad)
-    y2 = min(h_img, y + h + pad)
-    return img[y1:y2, x1:x2]
+    hi, wi = img.shape[:2]
+    return img[max(0,y-pad):min(hi,y+h+pad), max(0,x-pad):min(wi,x+w+pad)]
 
 
-def detect_and_split_feet(img_bgr: np.ndarray, pad: int = 25):
-    """
-    Analiza si la imagen contiene uno o dos pies y los devuelve recortados.
-
-    Para una placa bilateral (dos pies lado a lado con fondo negro) busca
-    el "valle" vertical entre los dos pies mediante proyección de columnas.
-
-    Retorna lista de (etiqueta, img_recortada).
-    """
-    h_img, w_img = img_bgr.shape[:2]
+def detect_and_split_feet(img_bgr, pad=25):
+    hi, wi = img_bgr.shape[:2]
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
-    # Máscara del contenido visible (no-negro)
-    _, fg_mask = cv2.threshold(gray, 12, 255, cv2.THRESH_BINARY)
-
-    # Suavizar para unir regiones cercanas
-    close_sz = max(5, w_img // 25)
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_sz, close_sz))
-    fg_closed = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, k)
-
-    # Proyección vertical: píxeles iluminados por columna
-    col_sum = np.sum(fg_closed > 0, axis=0).astype(np.float32)
-
-    # Suavizar proyección con convolución
-    smooth_k = max(3, w_img // 20)
-    kernel = np.ones(smooth_k, dtype=np.float32) / smooth_k
-    col_smooth = np.convolve(col_sum, kernel, mode="same")
-
-    # Buscar el valle sólo en el tercio central (donde estaría la separación)
-    q1, q3 = w_img // 4, 3 * w_img // 4
-    center_proj = col_smooth[q1:q3]
-    valley_val   = center_proj.min()
-    max_val      = col_smooth.max()
-
-    # Si el valle es < 20 % del máximo → hay separación clara → dos pies
-    two_feet = valley_val < max_val * 0.20
-
-    if two_feet:
-        split_x = q1 + int(np.argmin(center_proj))
-
-        left_img  = img_bgr[:, :split_x + pad]
-        right_img = img_bgr[:, max(0, split_x - pad):]
-
-        left_crop  = crop_to_content(left_img,  pad)
-        right_crop = crop_to_content(right_img, pad)
-
-        # Convención radiológica AP: izquierda de imagen = pie DERECHO del paciente
-        return [
-            ("Pie Derecho (D)",    left_crop),
-            ("Pie Izquierdo (I)",  right_crop),
-        ]
-    else:
-        return [("Pie", crop_to_content(img_bgr, pad))]
+    _, fg = cv2.threshold(gray, 12, 255, cv2.THRESH_BINARY)
+    ksz = max(5, wi // 25)
+    k   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz))
+    fg_c = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, k)
+    col  = np.sum(fg_c > 0, axis=0).astype(np.float32)
+    ksm  = max(3, wi // 20)
+    col_s = np.convolve(col, np.ones(ksm) / ksm, mode="same")
+    q1, q3 = wi // 4, 3 * wi // 4
+    mid = col_s[q1:q3]
+    if mid.min() < col_s.max() * 0.20:
+        sx   = q1 + int(np.argmin(mid))
+        left  = crop_to_content(img_bgr[:, :sx+pad], pad)
+        right = crop_to_content(img_bgr[:, max(0,sx-pad):], pad)
+        return [("Pie Derecho (D)", left), ("Pie Izquierdo (I)", right)]
+    return [("Pie", crop_to_content(img_bgr, pad))]
 
 
 # ══════════════════════════════════════════════════════════════
-# PIPELINE DE VISIÓN ARTIFICIAL
+# VISUALIZACIÓN: dibujar progreso sobre la imagen
 # ══════════════════════════════════════════════════════════════
 
-def preprocess(gray: np.ndarray) -> np.ndarray:
-    norm     = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-    clahe    = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(norm)
-    return cv2.fastNlMeansDenoising(enhanced, h=10)
-
-
-def segment(img_proc: np.ndarray) -> np.ndarray:
-    k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-
-    candidates = []
-    for inv in [False, True]:
-        src = 255 - img_proc if inv else img_proc
-        _, otsu = cv2.threshold(src, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        adapt = cv2.adaptiveThreshold(
-            src, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 51, -10)
-        for mask in [otsu, adapt]:
-            m = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k5)
-            m = cv2.morphologyEx(m,    cv2.MORPH_OPEN,  k3)
-            candidates.append(m)
-
-    def elongated_count(mask):
-        n, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-        c = 0
-        for i in range(1, n):
-            a  = stats[i, cv2.CC_STAT_AREA]
-            bw = stats[i, cv2.CC_STAT_WIDTH]
-            bh = stats[i, cv2.CC_STAT_HEIGHT]
-            if a < 300: continue
-            if max(bw, bh) / (min(bw, bh) + 1) > 1.8:
-                c += 1
-        return c
-
-    return max(candidates, key=elongated_count)
-
-
-def pca_axis(pts: np.ndarray):
-    mean = pts.mean(axis=0)
-    c    = pts - mean
-    cov  = (c.T @ c) / len(pts)
-    vals, vecs = np.linalg.eigh(cov)
-    idx  = np.argsort(vals)[::-1]
-    vals, vecs = vals[idx], vecs[:, idx]
-    elong = np.sqrt(vals[0] / (vals[1] + 1e-9))
-    return mean, vecs[:, 0], elong, vals
-
-
-def extract_bones(mask: np.ndarray, min_area_frac=0.001, min_elong=2.0):
+def draw_progress(foot_pil: Image.Image, points: list) -> Image.Image:
     """
-    Detecta estructuras óseas elongadas con tres filtros calibrados:
-
-    1. Área ≥ 0.1% imagen  → elimina caracteres de texto sueltos.
-    2. Elongación ≥ 2.5    → solo estructuras alargadas tipo hueso.
-    3. Orientación suave   → |axis_x| < 0.82 rechaza solo lo que es
-       casi perfectamente horizontal (texto de cabecera de placa).
-       Acepta huesos hasta ~55° desde la vertical, cubriendo incluso
-       falanges muy desviadas en Hallux Valgus severo (40-50°).
+    Dibuja los puntos y líneas acumulados sobre la imagen del pie.
+    points = lista de (x, y) en coordenadas de la imagen original.
     """
-    h, w = mask.shape
-    min_area = int(w * h * min_area_frac)
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-    bones = []
+    img    = foot_pil.copy().convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw   = ImageDraw.Draw(overlay)
 
-    for i in range(1, n):
-        area = stats[i, cv2.CC_STAT_AREA]
-        if area < min_area: continue
+    bone_colors = {"MT1": (248, 113, 113), "MT2": (52, 211, 153), "PF1": (96, 165, 250)}
 
-        bw = stats[i, cv2.CC_STAT_WIDTH]
-        bh = stats[i, cv2.CC_STAT_HEIGHT]
-        # NO se filtra por bounding-box AR: un hueso inclinado 45° tiene
-        # bbox cuadrado (AR=1.0) aunque sea muy elongado. El PCA calcula
-        # la elongación real y es el único filtro de forma que usamos.
+    for i, pt in enumerate(points):
+        step = CLICK_STEPS[i]
+        r, g, b = bone_colors[step["bone"]]
+        x, y = int(pt[0]), int(pt[1])
 
-        ys, xs = np.where(labels == i)
-        pts = np.stack([xs, ys], axis=1).astype(np.float64)
-        if len(pts) < 40: continue
+        # Punto
+        draw.ellipse([(x-8, y-8), (x+8, y+8)], fill=(r, g, b, 220))
+        draw.ellipse([(x-3, y-3), (x+3, y+3)], fill=(255, 255, 255, 230))
 
-        center, axis, elong, vals = pca_axis(pts)
-        if elong < min_elong: continue
+        # Línea cuando tenemos el segundo punto del mismo hueso
+        if i % 2 == 1:
+            prev = points[i - 1]
+            px, py = int(prev[0]), int(prev[1])
+            draw.line([(px, py), (x, y)], fill=(r, g, b, 210), width=4)
+            # Etiqueta en el centro de la línea
+            mx, my = (px + x) // 2, (py + y) // 2
+            draw.rectangle([(mx-22, my-13), (mx+22, my+13)], fill=(0, 0, 0, 160))
+            draw.text((mx - 17, my - 10), step["bone"], fill=(r, g, b, 255))
 
-        # Rechaza solo estructuras casi puramente horizontales (texto cabecera).
-        # Umbral 0.90 = permite ángulos hasta ~64° desde la vertical.
-        # Necesario porque en HV severo la falange del hallux puede estar
-        # a 50-60° de la vertical. El texto de la placa está a <10° de la
-        # horizontal (>80° de la vertical) → sigue siendo rechazado.
-        if abs(axis[0]) >= 0.90:
-            continue
-
-        proj   = (pts - center) @ axis
-        length = float(proj.max() - proj.min())
-
-        bones.append({
-            "center": center, "axis": axis,
-            "elongation": elong, "length": length,
-            "area": int(area), "label": "",
-        })
-
-    # Top 9 por longitud para evitar fragmentos residuales
-    bones = sorted(bones, key=lambda b: b["length"], reverse=True)[:9]
-    return bones
-
-
-def classify_bones(bones: list, foot_label: str = ""):
-    """
-    Clasificación anatómica de los huesos del antepié.
-
-    Regla 1 — Metatarsianos:
-      Hay EXACTAMENTE 5 metatarsianos. Se toman los 5 de mayor longitud.
-      (Esto evita confundir la falange proximal larga del HV severo con un MT.)
-
-    Regla 2 — Falanges:
-      El resto de candidatos que estén MÁS DISTALES que el promedio de los MTs
-      (es decir, con y < promedio_y de los MTs) se clasifican como falanges.
-
-    Regla 3 — Orden medial→lateral:
-      Pie D: MT1 = más a la IZQUIERDA de la imagen (x mínimo)
-      Pie I: MT1 = más a la DERECHA de la imagen (x máximo)
-    """
-    if len(bones) < 2:
-        return [], []
-
-    # ── Regla 1: los 5 más largos son metatarsianos ──────────
-    bones_by_len = sorted(bones, key=lambda b: b["length"], reverse=True)
-    n_meta       = min(5, len(bones_by_len))
-    meta_raw     = bones_by_len[:n_meta]
-    phal_raw     = bones_by_len[n_meta:]
-
-    # ── Regla 2: falanges deben estar MÁS ARRIBA que los MTs ─
-    # (menor y = más distal = zona de los dedos)
-    if meta_raw:
-        meta_y_mean = float(np.mean([b["center"][1] for b in meta_raw]))
-        phal = [b for b in phal_raw if b["center"][1] < meta_y_mean]
-    else:
-        phal = phal_raw
-
-    # ── Regla 3: orden medial→lateral ───────────────────────
-    reverse = "Izquierdo" in foot_label or "(I)" in foot_label
-    meta = sorted(meta_raw, key=lambda b: b["center"][0], reverse=reverse)
-    phal = sorted(phal,     key=lambda b: b["center"][0], reverse=reverse)
-
-    for i, b in enumerate(meta): b["label"] = f"MT{i+1}"
-    for i, b in enumerate(phal): b["label"] = f"PF{i+1}"
-    return meta, phal
-
-
-def angle_between(d1: np.ndarray, d2: np.ndarray) -> float:
-    d1 = d1 / (np.linalg.norm(d1) + 1e-9)
-    d2 = d2 / (np.linalg.norm(d2) + 1e-9)
-    cos_a = np.clip(abs(np.dot(d1, d2)), 0.0, 1.0)
-    a = np.degrees(np.arccos(cos_a))
-    return round(min(a, 180.0 - a), 1)
-
-
-def confidence_score(b1, b2) -> float:
-    return round(min(1.0, (b1["elongation"] + b2["elongation"]) / 16.0), 2)
-
-
-def bone_endpoints(bone):
-    """
-    Devuelve (extremo_distal, extremo_proximal) de un hueso.
-    Distal  = extremo con y MÁS PEQUEÑO  (hacia los dedos, arriba en la imagen).
-    Proximal = extremo con y MÁS GRANDE  (hacia el talón, abajo en la imagen).
-    """
-    c  = np.array(bone["center"])
-    a  = np.array(bone["axis"])
-    hl = bone["length"] / 2
-    e1, e2 = c + a * hl, c - a * hl
-    if e1[1] < e2[1]:
-        return e1, e2   # e1 = distal (menor y)
-    return e2, e1       # e2 = distal
-
-
-def measure_angles(meta: list, phal: list) -> dict:
-    """
-    Calcula AHV, AIM 1-2 y AIM 2-5.
-
-    Para AHV: busca la falange cuya BASE PROXIMAL está más cerca de la
-    CABEZA DISTAL de MT1.  Esto es anatómicamente correcto porque la
-    falange proximal del hallux articula con la cabeza del 1er metatarsiano
-    en la articulación MTF1.  Funciona correctamente incluso en HV severo
-    donde el centro de la falange está desplazado lateralmente respecto a MT1.
-    """
-    results = {}
-
-    if len(meta) >= 1 and len(phal) >= 1:
-        mt1 = meta[0]
-        mt1_head, _ = bone_endpoints(mt1)   # cabeza distal de MT1
-
-        def dist_base_to_mt1_head(pf):
-            _, pf_base = bone_endpoints(pf)  # base proximal de la falange
-            return float(np.linalg.norm(pf_base - mt1_head))
-
-        pf1 = min(phal, key=dist_base_to_mt1_head)
-        results["AHV"] = {
-            "angle":      angle_between(mt1["axis"], pf1["axis"]),
-            "bone1":      mt1,
-            "bone2":      pf1,
-            "confidence": confidence_score(mt1, pf1),
-        }
-
-    if len(meta) >= 2:
-        results["AIM12"] = {
-            "angle":      angle_between(meta[0]["axis"], meta[1]["axis"]),
-            "bone1":      meta[0],
-            "bone2":      meta[1],
-            "confidence": confidence_score(meta[0], meta[1]),
-        }
-
-    if len(meta) >= 5:
-        results["AIM25"] = {
-            "angle":      angle_between(meta[1]["axis"], meta[4]["axis"]),
-            "bone1":      meta[1],
-            "bone2":      meta[4],
-            "confidence": confidence_score(meta[1], meta[4]),
-        }
-
-    return results
+    combined = Image.alpha_composite(img, overlay)
+    return combined.convert("RGB")
 
 
 # ══════════════════════════════════════════════════════════════
-# VISUALIZACIÓN
+# REPOSITORIO
 # ══════════════════════════════════════════════════════════════
 
-def draw_overlay(img_bgr: np.ndarray, meta: list, phal: list,
-                 measurements: dict, label: str = "") -> np.ndarray:
-    out = img_bgr.copy()
-    h, w = out.shape[:2]
+def init_repo():
+    if "repo" not in st.session_state:
+        if os.path.exists(REPO_FILE):
+            try:
+                st.session_state["repo"] = pd.read_csv(REPO_FILE)
+                return
+            except Exception:
+                pass
+        st.session_state["repo"] = pd.DataFrame(columns=REPO_COLS)
 
-    def draw_axis(bone, color, thickness=1):
-        c  = bone["center"].astype(int)
-        hl = int(bone["length"] / 2)
-        p1 = tuple(np.clip(c - bone["axis"] * hl, 0, [w-1, h-1]).astype(int))
-        p2 = tuple(np.clip(c + bone["axis"] * hl, 0, [w-1, h-1]).astype(int))
-        cv2.line(out, p1, p2, color, thickness)
-        cv2.circle(out, tuple(c), 4, color, -1)
-        cv2.putText(out, bone.get("label", ""), (c[0]+5, c[1]-6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA)
 
-    for b in meta: draw_axis(b, (160, 160, 160), 1)
-    for b in phal: draw_axis(b, (110, 110, 110), 1)
+def get_repo() -> pd.DataFrame:
+    return st.session_state.get("repo", pd.DataFrame(columns=REPO_COLS))
 
-    y_off = 20
-    for key, m in measurements.items():
-        info = ANGLE_INFO[key]
-        col  = info["color_bgr"]
-        sev, _ = get_severity(m["angle"], info)
-        conf_pct = int(m["confidence"] * 100)
 
-        draw_axis(m["bone1"], col, 2)
-        draw_axis(m["bone2"], col, 2)
+def append_to_repo(row: dict):
+    df  = get_repo()
+    new = pd.DataFrame([{c: row.get(c, "") for c in REPO_COLS}])
+    st.session_state["repo"] = pd.concat([df, new], ignore_index=True)
+    try:
+        st.session_state["repo"].to_csv(REPO_FILE, index=False)
+    except Exception:
+        pass
 
-        txt = f"{key}: {m['angle']}  {sev}  (conf.{conf_pct}%)"
-        (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)
-        cv2.rectangle(out, (7, y_off-th-3), (11+tw, y_off+4), (12, 12, 18), -1)
-        cv2.rectangle(out, (7, y_off-th-3), (11+tw, y_off+4), col, 1)
-        cv2.putText(out, txt, (9, y_off),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, col, 1, cv2.LINE_AA)
-        y_off += 28
 
-    # Etiqueta del pie (D / I)
-    if label:
-        cv2.putText(out, label, (9, h - 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 255), 1, cv2.LINE_AA)
-
-    note = "RESULTADO AUTOMATICO - REQUIERE VERIFICACION CLINICA"
-    (nw, nh), _ = cv2.getTextSize(note, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
-    cv2.rectangle(out, (7, h-28), (11+nw, h-8), (12, 12, 18), -1)
-    cv2.putText(out, note, (9, h - 12),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (120, 120, 200), 1, cv2.LINE_AA)
-    return out
+def repo_to_excel(df: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Hallux Valgus")
+        ws = writer.sheets["Hallux Valgus"]
+        for col_cells in ws.columns:
+            max_len = max(len(str(c.value or "")) for c in col_cells) + 3
+            ws.column_dimensions[col_cells[0].column_letter].width = min(max_len, 40)
+    buf.seek(0)
+    return buf.getvalue()
 
 
 # ══════════════════════════════════════════════════════════════
-# FUNCIÓN PRINCIPAL DE ANÁLISIS
+# MÓDULO DE MEDICIÓN POR PIE
 # ══════════════════════════════════════════════════════════════
 
-def analyze_single(img_bgr: np.ndarray, label: str = "Pie",
-                   min_elongation: float = 2.5) -> dict:
+def measure_foot(foot_label: str, foot_bgr: np.ndarray,
+                 state_key: str, rut: str, nombre: str,
+                 exam_date, lateralidad: str, operado: str, notas: str):
     """
-    Analiza un único pie recortado.
-
-    Recorte al ANTEPIÉ (70 % superior):
-      Los ángulos AHV y AIM solo necesitan metatarsianos y falanges.
-      El calcáneo, tarsales y tobillo están en el tercio inferior y
-      generaban falsos positivos que confundían al clasificador.
-      Analizamos solo el 70 % superior y dibujamos sobre la imagen completa.
+    Interfaz de medición para un pie.
+    El médico hace 6 clics en orden: MT1×2, MT2×2, PF1×2.
+    La app dibuja las líneas progresivamente y calcula los ángulos al final.
     """
-    h, w = img_bgr.shape[:2]
+    foot_pil  = Image.fromarray(cv2.cvtColor(foot_bgr, cv2.COLOR_BGR2RGB))
+    orig_w, orig_h = foot_pil.size
 
-    # ── Limitar al antepié ────────────────────────────────────
-    forefoot_h  = int(h * 0.70)
-    forefoot    = img_bgr[:forefoot_h, :]
+    # Estado de esta medición
+    if state_key not in st.session_state:
+        st.session_state[state_key] = {"points": [], "saved": False}
+    state  = st.session_state[state_key]
+    points = state["points"]
+    n      = len(points)
 
-    gray  = cv2.cvtColor(forefoot, cv2.COLOR_BGR2GRAY)
-    proc  = preprocess(gray)
-    mask  = segment(proc)
-    bones = extract_bones(mask, min_elong=min_elongation)
-    meta, phal = classify_bones(bones, foot_label=label)
-    meas  = measure_angles(meta, phal)
+    st.markdown(f"### {foot_label}")
+    st.caption(f"Imagen: {orig_w}×{orig_h} px")
 
-    # Dibujar sobre el recorte del antepié y reincrustar en la imagen completa
-    forefoot_ann = draw_overlay(forefoot, meta, phal, meas, label)
-    img_r = img_bgr.copy()
-    img_r[:forefoot_h, :] = forefoot_ann
+    left_col, right_col = st.columns([3, 2])
 
-    return {
-        "label":        label,
-        "measurements": meas,
-        "meta":         meta,
-        "phal":         phal,
-        "img_result":   img_r,
-        "bones_total":  len(bones),
-    }
+    with left_col:
+        # ── Instrucción del paso actual ──────────────────────
+        if n < 6:
+            step = CLICK_STEPS[n]
+            st.markdown(
+                f'<div style="background:#161b22;padding:9px 13px;'
+                f'border-radius:7px;border-left:3px solid {step["color"]};'
+                f'font-size:0.88rem;color:{step["color"]};margin-bottom:8px">'
+                f'👆 Clic {n+1}/6 — {step["desc"]}</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div style="background:#0f2a18;padding:9px 13px;'
+                'border-radius:7px;border-left:3px solid #56d364;'
+                'font-size:0.88rem;color:#56d364;margin-bottom:8px">'
+                '✅ Medición completa</div>',
+                unsafe_allow_html=True,
+            )
 
+        # ── Imagen con progreso ───────────────────────────────
+        img_annotated = draw_progress(foot_pil, points)
 
-def analyze(img_bgr: np.ndarray, min_elongation: float = 2.0) -> list:
-    """
-    Pipeline completo.
-    Detecta automáticamente si hay uno o dos pies y analiza cada uno.
-    Devuelve lista de resultados (uno por pie).
-    """
-    feet = detect_and_split_feet(img_bgr)
-    return [analyze_single(foot_img, lbl, min_elongation)
-            for lbl, foot_img in feet]
+        if n < 6:
+            # Escalar para visualización (máx 680px de ancho)
+            max_w = 680
+            if orig_w > max_w:
+                scale = max_w / orig_w
+                disp_w = max_w
+                disp_h = int(orig_h * scale)
+            else:
+                disp_w, disp_h = orig_w, orig_h
+
+            img_display = img_annotated.resize((disp_w, disp_h), Image.LANCZOS)
+
+            coord = streamlit_image_coordinates(
+                img_display,
+                key=f"{state_key}_click_{n}",
+            )
+
+            if coord is not None:
+                # Convertir coordenadas de pantalla → imagen original
+                sx = orig_w / disp_w
+                sy = orig_h / disp_h
+                ix = int(coord["x"] * sx)
+                iy = int(coord["y"] * sy)
+                state["points"].append((ix, iy))
+                st.rerun()
+        else:
+            # Mostrar imagen final sin widget de clics
+            st.image(img_annotated, use_container_width=True)
+
+        # Botón para reiniciar
+        if n > 0:
+            if st.button("🔄 Repetir medición", key=f"reset_{state_key}"):
+                state["points"] = []
+                state["saved"]  = False
+                st.rerun()
+
+    # ── Panel de resultados ───────────────────────────────────
+    with right_col:
+        st.markdown("#### Progreso")
+
+        # Barra de progreso
+        prog_pct = int(n / 6 * 100)
+        st.progress(prog_pct, text=f"{n}/6 puntos marcados")
+
+        # Estado de cada hueso
+        for bone_key, color, idx_start in [("MT1","#f87171",0),("MT2","#34d399",2),("PF1","#60a5fa",4)]:
+            pts_placed = sum(1 for j in range(idx_start, idx_start+2) if j < n)
+            icons = {0: "⬜⬜", 1: "🟡⬜", 2: "✅✅"}
+            st.markdown(
+                f'<span style="color:{color}">●</span> '
+                f'<span style="font-size:0.82rem"><b>{bone_key}</b> {icons[pts_placed]}</span>',
+                unsafe_allow_html=True,
+            )
+
+        if n == 6:
+            st.markdown("---")
+            st.markdown("#### Resultados")
+
+            # Extraer líneas
+            mt1 = (points[0], points[1])
+            mt2 = (points[2], points[3])
+            pf1 = (points[4], points[5])
+
+            ahv = calc_angle(mt1[0], mt1[1], pf1[0], pf1[1])
+            aim = calc_angle(mt1[0], mt1[1], mt2[0], mt2[1])
+
+            for angle, key in [(ahv, "AHV"), (aim, "AIM12")]:
+                info = ANGLE_INFO[key]
+                sev, sev_col = get_severity(angle, key)
+                st.markdown(f"""
+                <div style="background:#161b22;border:1px solid #30363d;
+                            border-left:3px solid {info['color']};
+                            border-radius:8px;padding:12px;
+                            text-align:center;margin-bottom:10px">
+                  <div style="font-size:0.72rem;color:#8b949e">{info['name']}</div>
+                  <div style="font-size:2rem;font-weight:700;
+                              color:{sev_col};margin:3px 0">{angle}°</div>
+                  <div style="font-size:0.82rem;font-weight:600;
+                              color:{sev_col}">{sev}</div>
+                  <div style="font-size:0.68rem;color:#4b5563">
+                    Normal ≤{info['normal']}°</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            # Guardar
+            st.markdown("---")
+            if not rut.strip():
+                st.warning("Ingresa el RUT en el panel lateral para guardar.")
+            elif state.get("saved"):
+                st.success("✅ Guardado en repositorio")
+                if st.button("Guardar corrección", key=f"resave_{state_key}"):
+                    state["saved"] = False
+                    st.rerun()
+            else:
+                if st.button(f"💾 Guardar — {foot_label}",
+                             type="primary",
+                             key=f"save_{state_key}",
+                             use_container_width=True):
+                    append_to_repo({
+                        "RUT":                  rut.strip(),
+                        "Nombre":               nombre.strip(),
+                        "Fecha":                exam_date.strftime("%Y-%m-%d"),
+                        "Lateralidad":          lateralidad,
+                        "Operado":              operado,
+                        "Pie":                  foot_label,
+                        "AHV (°)":              ahv,
+                        "AHV Clasificación":    get_severity(ahv, "AHV")[0],
+                        "AIM 1-2 (°)":          aim,
+                        "AIM 1-2 Clasificación":get_severity(aim, "AIM12")[0],
+                        "Notas":                notas.strip(),
+                    })
+                    state["saved"] = True
+                    st.success("✅ Guardado")
+                    st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════
-# INTERFAZ STREAMLIT
+# APP PRINCIPAL
 # ══════════════════════════════════════════════════════════════
-
-def render_foot_results(res: dict):
-    """Muestra resultados de un pie individual."""
-    meas     = res["measurements"]
-    n_bones  = res["bones_total"]
-    label    = res["label"]
-
-    st.markdown(f"#### {label}")
-    st.caption(f"Estructuras detectadas: {n_bones} "
-               f"(MT: {len(res['meta'])} · PF: {len(res['phal'])})")
-
-    if not meas:
-        st.warning("No se calcularon ángulos para este pie. "
-                   "Ajusta la elongación mínima o verifica la imagen.")
-        return
-
-    cols = st.columns(len(meas))
-    for i, (key, m) in enumerate(meas.items()):
-        info = ANGLE_INFO[key]
-        sev, sev_col = get_severity(m["angle"], info)
-        conf_pct = int(m["confidence"] * 100)
-        with cols[i]:
-            st.markdown(f"""
-            <div style="background:#161b22; border:1px solid {info['color_hex']}44;
-                        border-left:3px solid {info['color_hex']};
-                        border-radius:8px; padding:14px; text-align:center;">
-              <div style="color:#8b949e; font-size:0.72rem;">{info['name']}</div>
-              <div style="font-size:2rem; font-weight:700; color:{sev_col};
-                          margin:4px 0">{m['angle']}°</div>
-              <div style="font-size:0.82rem; font-weight:600;
-                          color:{sev_col}">{sev}</div>
-              <div style="font-size:0.67rem; color:#4b5563; margin-top:4px">
-                Confianza: {conf_pct}%
-              </div>
-              <div style="font-size:0.67rem; color:#4b5563">
-                Normal ≤{info['normal']}°
-              </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-    # Tabla
-    rows = []
-    for key, m in meas.items():
-        info = ANGLE_INFO[key]
-        sev, _ = get_severity(m["angle"], info)
-        rows.append({
-            "Ángulo":        key,
-            "Nombre":        info["name"],
-            "Valor (°)":     m["angle"],
-            "Clasificación": sev,
-            "Confianza (%)": int(m["confidence"] * 100),
-            "Normal ≤":      f"{info['normal']}°",
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
 
 def main():
     st.set_page_config(
-        page_title="Auto-Medición Hallux Valgus",
+        page_title="Hallux Valgus — Medición",
         page_icon="🦴",
         layout="wide",
         initial_sidebar_state="expanded",
@@ -537,273 +488,266 @@ def main():
       [data-testid="stAppViewContainer"] { background: #0d1117; }
       [data-testid="stSidebar"]          { background: #161b22; }
       h1,h2,h3,h4 { color: #58a6ff; }
-      .warn-box {
-          background:#1c1a10; border:1px solid #6e5203;
-          border-radius:8px; padding:12px 16px;
-          color:#d4aa40; font-size:0.82rem; margin-top:12px;
-      }
     </style>
     """, unsafe_allow_html=True)
 
+    init_repo()
+
     # ── Sidebar ──────────────────────────────────────────────
     with st.sidebar:
-        st.markdown("## ⚙️ Parámetros")
-        st.markdown("---")
-        min_elong = st.slider(
-            "Elongación mínima de hueso",
-            min_value=1.5, max_value=6.0, value=2.0, step=0.1,
-            help="2.0 recomendado. Sube si detecta ruido; baja si no encuentra huesos.",
-        )
-        st.markdown("---")
-        st.markdown("### 📋 Rangos normales")
-        for k, v in ANGLE_INFO.items():
-            st.markdown(
-                f"**{k}** — Normal ≤{v['normal']}° · "
-                f"Leve ≤{v['mild']}° · Mod. ≤{v['moderate']}°"
+        st.markdown("## 🦴 Hallux Valgus")
+        st.markdown("### Datos del paciente")
+
+        # ── Extracción automática desde la imagen ────────────
+        if OCR_OK:
+            if st.button("🔍 Extraer datos de la imagen",
+                         help="Lee el texto de la radiografía para pre-llenar RUT y nombre",
+                         use_container_width=True):
+                st.session_state["ocr_trigger"] = True
+        else:
+            st.caption(
+                "💡 Instala `pytesseract` y Tesseract para extraer "
+                "datos automáticamente desde la radiografía."
             )
+
+        # Campos del paciente (se pre-llenan si OCR encontró datos)
+        rut    = st.text_input("RUT *",
+                               value=st.session_state.get("ocr_rut", ""),
+                               placeholder="12.345.678-9")
+        nombre = st.text_input("Nombre",
+                               value=st.session_state.get("ocr_nombre", ""),
+                               placeholder="Apellido Nombre")
+        fecha        = st.date_input("Fecha examen", value=date.today())
+        lateralidad  = st.selectbox("Lateralidad afectada",
+                                    ["Bilateral", "Derecho", "Izquierdo"],
+                                    help="Lado clínicamente afectado")
+        operado      = st.radio("¿Operado?", ["No", "Sí"],
+                                horizontal=True,
+                                help="¿El paciente tiene cirugía previa de HV?")
+        notas        = st.text_area("Notas clínicas", height=80)
+
         st.markdown("---")
+        st.markdown("### 📋 Protocolo")
         st.markdown("""
-        ### ℹ️ Acerca de esta herramienta
-        Usa **visión artificial (OpenCV + PCA)** para detectar
-        automáticamente los ejes óseos del pie.
+        **6 clics por pie en este orden:**
 
-        **Soporta:**
-        - Radiografías de un solo pie
-        - Radiografías **bilaterales** (dos pies en la misma placa)
-        - Modo lote (múltiples imágenes a la vez)
+        <span style="color:#f87171">●</span> **MT1** — 2 clics en la diáfisis del 1er metatarsiano
+        <span style="color:#34d399">●</span> **MT2** — 2 clics en la diáfisis del 2do metatarsiano
+        <span style="color:#60a5fa">●</span> **PF1** — 2 clics en la diáfisis de la falange proximal del hallux
 
-        **Optimizado para:** radiografías AP dorsoplantares estándar.
-        """)
+        Los clics definen el **eje longitudinal** de cada hueso.
+        """, unsafe_allow_html=True)
 
-    # ── Header ───────────────────────────────────────────────
-    st.markdown("# 🦴 Medición Automática — Hallux Valgus")
-    st.markdown(
-        "Detección automática de ejes óseos · "
-        "Soporta placas unilaterales y **bilaterales**"
-    )
-    st.markdown("---")
+        st.markdown("---")
+        st.markdown("### 📐 Rangos normales")
+        for k, v in ANGLE_INFO.items():
+            st.markdown(f"**{k}** ≤{v['normal']}° Normal · ≤{v['mild']}° Leve · ≤{v['moderate']}° Mod.")
 
-    tab1, tab2 = st.tabs([
-        "📷 Análisis individual",
-        "📁 Análisis por lote (múltiples imágenes)",
-    ])
+    # ── Tabs ─────────────────────────────────────────────────
+    st.markdown("# 🦴 Medición de Ángulos — Hallux Valgus")
+    tab_medir, tab_repo = st.tabs(["📏  Medir", "📊  Repositorio de pacientes"])
 
     # ════════════════════════════════════════════════════════
-    # TAB 1 — IMAGEN INDIVIDUAL
+    # TAB 1 — MEDIR
     # ════════════════════════════════════════════════════════
-    with tab1:
+    with tab_medir:
+        if not COORDS_OK:
+            st.error("""
+            **Instala el paquete de coordenadas:**
+            ```
+            pip3 install streamlit-image-coordinates
+            ```
+            Luego cierra y vuelve a abrir `Iniciar_App.command`.
+            """)
+            return
+
         uploaded = st.file_uploader(
-            "Sube una radiografía del pie (unilateral o bilateral)",
+            "Sube la radiografía AP del pie (unilateral o bilateral)",
             type=["jpg", "jpeg", "png", "tiff", "tif", "bmp"],
-            key="single",
         )
 
         if not uploaded:
             st.markdown("""
-            <div style="background:#161b22; border:2px dashed #30363d;
-                        border-radius:12px; padding:50px; text-align:center;
-                        color:#4b5563; margin-top:20px">
+            <div style="background:#161b22;border:2px dashed #30363d;
+                        border-radius:12px;padding:60px;text-align:center;
+                        margin-top:20px">
               <p style="font-size:3rem">📷</p>
-              <p style="font-size:1.05rem; color:#8b949e">
-                Sube una radiografía para comenzar el análisis automático
+              <p style="font-size:1rem;color:#8b949e">
+                Sube una radiografía AP del pie para comenzar
               </p>
-              <p style="font-size:0.78rem">
-                JPG · PNG · TIFF · BMP · Unilateral o bilateral
+              <p style="font-size:0.78rem;color:#4b5563">
+                JPG · PNG · TIFF · BMP  |  Unilateral o bilateral
               </p>
             </div>
             """, unsafe_allow_html=True)
+            return
 
-        else:
-            img_pil = Image.open(uploaded).convert("RGB")
-            img_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+        img_pil = Image.open(uploaded).convert("RGB")
+        img_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+        img_key = uploaded.name.replace(" ", "_").replace(".", "_")
 
-            with st.spinner("🔍 Detectando pies y analizando…"):
-                results = analyze(img_bgr, min_elongation=min_elong)
+        # ── OCR automático si el usuario lo pidió ─────────────
+        if st.session_state.pop("ocr_trigger", False):
+            with st.spinner("Leyendo datos de la imagen..."):
+                ocr_nombre, ocr_rut = ocr_patient_info(img_pil)
+            if ocr_nombre or ocr_rut:
+                if ocr_nombre: st.session_state["ocr_nombre"] = ocr_nombre
+                if ocr_rut:    st.session_state["ocr_rut"]    = ocr_rut
+                st.success(
+                    f"Datos encontrados → "
+                    f"{'Nombre: ' + ocr_nombre if ocr_nombre else ''}"
+                    f"{'  |  RUT: ' + ocr_rut if ocr_rut else ''}"
+                )
+                st.rerun()
+            else:
+                st.warning("No se encontraron datos legibles. Ingrésalos manualmente.")
 
-            n_feet = len(results)
-            st.success(
-                f"✅ {'Bilateral' if n_feet == 2 else 'Unilateral'} detectada — "
-                f"analizando **{n_feet} pie{'s' if n_feet > 1 else ''}**"
+        with st.spinner("Detectando pies..."):
+            feet = detect_and_split_feet(img_bgr)
+
+        n_feet = len(feet)
+        st.success(
+            f"{'Bilateral' if n_feet == 2 else 'Unilateral'} — "
+            f"{n_feet} pie(s) detectado(s)"
+        )
+
+        for i, (foot_label_auto, foot_bgr) in enumerate(feet):
+            st.markdown("---")
+
+            # ── Selector de lateralidad por pie ───────────────
+            lat_key = f"lat_{img_key}_{i}"
+            opciones = ["Derecho", "Izquierdo", "No especificado"]
+
+            # Pre-selección inteligente según el orden de detección
+            # (izquierda de imagen = índice 0, derecha = índice 1)
+            default_idx = 0 if i == 0 else 1
+
+            lc, _ = st.columns([1, 3])
+            with lc:
+                lado = st.selectbox(
+                    f"¿Qué pie es este? (imagen {i+1}/{n_feet})",
+                    opciones,
+                    index=default_idx,
+                    key=lat_key,
+                    help="Puedes cambiarlo si la imagen está como espejo",
+                )
+
+            foot_label = f"Pie {lado}"
+            foot_id    = f"pie_{i}_{img_key}"
+            state_key  = f"st_{img_key}_{foot_id}"
+
+            measure_foot(
+                foot_label=foot_label,
+                foot_bgr=foot_bgr,
+                state_key=state_key,
+                rut=rut,
+                nombre=nombre,
+                exam_date=fecha,
+                lateralidad=lateralidad,
+                operado=operado,
+                notas=notas,
             )
 
-            # ── Imágenes ──────────────────────────────────────
-            img_cols = st.columns(n_feet)
-            for i, res in enumerate(results):
-                with img_cols[i]:
-                    st.subheader(res["label"])
-                    st.image(
-                        cv2.cvtColor(res["img_result"], cv2.COLOR_BGR2RGB),
-                        use_container_width=True,
-                    )
-
-            st.markdown("---")
-
-            # ── Resultados por pie ────────────────────────────
-            if n_feet == 2:
-                res_cols = st.columns(2)
-                for i, res in enumerate(results):
-                    with res_cols[i]:
-                        render_foot_results(res)
-            else:
-                render_foot_results(results[0])
-
-            # ── Descargas ─────────────────────────────────────
-            st.markdown("---")
-            st.subheader("⬇️ Descargar resultados")
-
-            dl_cols = st.columns(n_feet + 1)
-
-            # Una imagen anotada por pie
-            for i, res in enumerate(results):
-                with dl_cols[i]:
-                    jpg = cv2.imencode(
-                        ".jpg", res["img_result"],
-                        [cv2.IMWRITE_JPEG_QUALITY, 95]
-                    )[1].tobytes()
-                    safe_label = res["label"].replace(" ", "_").replace("/","")
-                    st.download_button(
-                        f"Imagen — {res['label']}",
-                        data=jpg,
-                        file_name=f"{uploaded.name.rsplit('.',1)[0]}_{safe_label}.jpg",
-                        mime="image/jpeg",
-                    )
-
-            # JSON con todos los resultados
-            with dl_cols[-1]:
-                report = {
-                    "archivo":  uploaded.name,
-                    "fecha":    datetime.now().isoformat(),
-                    "tipo":     "bilateral" if n_feet == 2 else "unilateral",
-                    "pies": [
-                        {
-                            "pie": res["label"],
-                            "huesos_detectados": res["bones_total"],
-                            "mediciones": {
-                                k: {
-                                    "nombre":        ANGLE_INFO[k]["name"],
-                                    "angulo_grados": m["angle"],
-                                    "severidad":     get_severity(m["angle"], ANGLE_INFO[k])[0],
-                                    "confianza_pct": int(m["confidence"] * 100),
-                                    "rango_normal":  f"≤{ANGLE_INFO[k]['normal']}°",
-                                }
-                                for k, m in res["measurements"].items()
-                            },
-                        }
-                        for res in results
-                    ],
-                }
-                st.download_button(
-                    "Reporte JSON (ambos pies)",
-                    data=json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"),
-                    file_name=f"{uploaded.name.rsplit('.',1)[0]}_reporte.json",
-                    mime="application/json",
-                )
-
-            st.markdown("""
-            <div class="warn-box">
-              ⚠️ <strong>Verificación obligatoria:</strong>
-              Los valores son estimaciones automáticas. Revisar visualmente
-              los ejes detectados antes de registrar en el estudio.
-            </div>
-            """, unsafe_allow_html=True)
-
     # ════════════════════════════════════════════════════════
-    # TAB 2 — LOTE
+    # TAB 2 — REPOSITORIO
     # ════════════════════════════════════════════════════════
-    with tab2:
-        st.markdown(
-            "Sube varias radiografías a la vez (unilaterales y/o bilaterales). "
-            "El sistema las analiza todas y genera un resumen en CSV + ZIP."
-        )
+    with tab_repo:
+        st.markdown("## 📊 Repositorio de pacientes")
 
-        batch_files = st.file_uploader(
-            "Selecciona múltiples radiografías",
-            type=["jpg", "jpeg", "png", "tiff", "tif", "bmp"],
-            accept_multiple_files=True,
-            key="batch",
-        )
+        df = get_repo()
 
-        if not batch_files:
-            st.info("Selecciona una o más radiografías para el análisis por lote.")
-        else:
-            if st.button(f"🚀 Analizar {len(batch_files)} imagen(es)", type="primary"):
-                all_rows   = []
-                zip_images = []
-                progress   = st.progress(0, text="Procesando…")
-                status     = st.empty()
+        # ── Importar CSV de sesión anterior ──────────────────
+        with st.expander("📥 Importar datos de sesión anterior"):
+            imp = st.file_uploader("CSV exportado previamente", type=["csv"], key="imp_csv")
+            if imp:
+                try:
+                    df_imp = pd.read_csv(imp)
+                    merged = pd.concat([df, df_imp], ignore_index=True).drop_duplicates()
+                    st.session_state["repo"] = merged
+                    try:
+                        merged.to_csv(REPO_FILE, index=False)
+                    except Exception:
+                        pass
+                    st.success(f"✅ Importados {len(df_imp)} registros. Total: {len(merged)}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
-                for idx, f in enumerate(batch_files):
-                    status.markdown(f"⏳ Procesando **{f.name}**…")
-                    img_bgr = cv2.cvtColor(
-                        np.array(Image.open(f).convert("RGB")), cv2.COLOR_RGB2BGR
-                    )
-                    results = analyze(img_bgr, min_elongation=min_elong)
+        if df.empty:
+            st.info("El repositorio está vacío. Realiza mediciones y guárdalas.")
+            return
 
-                    for res in results:
-                        row = {
-                            "Archivo": f.name,
-                            "Pie":     res["label"],
-                            "Huesos":  res["bones_total"],
-                        }
-                        for k in ANGLE_INFO:
-                            if k in res["measurements"]:
-                                m    = res["measurements"][k]
-                                info = ANGLE_INFO[k]
-                                row[f"{k} (°)"]      = m["angle"]
-                                row[f"{k} Clasif."]  = get_severity(m["angle"], info)[0]
-                                row[f"{k} Conf.(%)"] = int(m["confidence"] * 100)
-                            else:
-                                row[f"{k} (°)"]      = "—"
-                                row[f"{k} Clasif."]  = "—"
-                                row[f"{k} Conf.(%)"] = "—"
-                        all_rows.append(row)
+        # ── Filtros ───────────────────────────────────────────
+        fc1, fc2, fc3, fc4 = st.columns(4)
+        with fc1:
+            rut_f = st.text_input("Buscar RUT", key="f_rut")
+        with fc2:
+            pie_f = st.selectbox("Pie", ["Todos","Pie Derecho (D)","Pie Izquierdo (I)","Pie"], key="f_pie")
+        with fc3:
+            cls_f = st.selectbox("AHV", ["Todos","Normal","Leve","Moderado","Severo"], key="f_cls")
+        with fc4:
+            op_f  = st.selectbox("Operado", ["Todos","No","Sí"], key="f_op")
 
-                        # Guardar imagen anotada
-                        safe = res["label"].replace(" ", "_").replace("/","")
-                        jpg  = cv2.imencode(
-                            ".jpg", res["img_result"],
-                            [cv2.IMWRITE_JPEG_QUALITY, 92]
-                        )[1].tobytes()
-                        zip_images.append(
-                            (f"{f.name.rsplit('.',1)[0]}_{safe}.jpg", jpg)
-                        )
+        df_show = df.copy()
+        if rut_f:
+            df_show = df_show[df_show["RUT"].astype(str).str.contains(rut_f, na=False)]
+        if pie_f != "Todos":
+            df_show = df_show[df_show["Pie"] == pie_f]
+        if cls_f != "Todos":
+            df_show = df_show[df_show.get("AHV Clasificación", pd.Series()) == cls_f]
+        if op_f != "Todos":
+            df_show = df_show[df_show.get("Operado", pd.Series()) == op_f]
 
-                    progress.progress(
-                        (idx + 1) / len(batch_files),
-                        text=f"{idx+1}/{len(batch_files)} procesadas"
-                    )
+        # ── Estadísticas ──────────────────────────────────────
+        s1, s2, s3, s4 = st.columns(4)
+        ahv_vals  = pd.to_numeric(df_show.get("AHV (°)", pd.Series()),     errors="coerce").dropna()
+        aim_vals  = pd.to_numeric(df_show.get("AIM 1-2 (°)", pd.Series()), errors="coerce").dropna()
+        n_sev     = (df_show.get("AHV Clasificación", pd.Series()) == "Severo").sum()
+        with s1: st.metric("Registros",     len(df_show))
+        with s2: st.metric("AHV promedio",  f"{ahv_vals.mean():.1f}°"  if not ahv_vals.empty  else "—")
+        with s3: st.metric("AIM 1-2 prom.", f"{aim_vals.mean():.1f}°"  if not aim_vals.empty  else "—")
+        with s4: st.metric("AHV Severos",   int(n_sev))
 
-                status.success(
-                    f"✅ Completado — {len(batch_files)} imágenes · "
-                    f"{len(all_rows)} pies analizados"
-                )
-                progress.empty()
+        st.dataframe(df_show, use_container_width=True, hide_index=True)
 
-                df = pd.DataFrame(all_rows)
-                st.subheader("📊 Resumen del lote")
-                st.dataframe(df, use_container_width=True, hide_index=True)
+        # ── Exportar ──────────────────────────────────────────
+        st.markdown("### ⬇️ Exportar datos")
+        dl1, dl2 = st.columns(2)
 
-                # ZIP
-                zip_buf = io.BytesIO()
-                with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                    zf.writestr("resumen_hallux_valgus.csv",
-                                df.to_csv(index=False).encode("utf-8"))
-                    for fname, data in zip_images:
-                        zf.writestr(fname, data)
-                zip_buf.seek(0)
-
+        with dl1:
+            st.download_button(
+                "📄 Descargar CSV",
+                data=df.to_csv(index=False).encode("utf-8"),
+                file_name=f"hallux_valgus_{datetime.now():%Y%m%d_%H%M}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        with dl2:
+            try:
+                xlsx = repo_to_excel(df)
                 st.download_button(
-                    "⬇️ Descargar ZIP (imágenes anotadas + CSV)",
-                    data=zip_buf.getvalue(),
-                    file_name=f"hallux_valgus_{datetime.now():%Y%m%d_%H%M}.zip",
-                    mime="application/zip",
+                    "📊 Descargar Excel",
+                    data=xlsx,
+                    file_name=f"hallux_valgus_{datetime.now():%Y%m%d_%H%M}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
                 )
+            except Exception:
+                st.info("Instala openpyxl para exportar Excel: `pip3 install openpyxl`")
 
-                st.markdown("""
-                <div class="warn-box">
-                  ⚠️ Revisar cada imagen anotada antes de incluir los valores en el estudio.
-                </div>
-                """, unsafe_allow_html=True)
+        # ── Gestión ───────────────────────────────────────────
+        with st.expander("🗑️ Eliminar registros por RUT"):
+            del_rut = st.text_input("RUT a eliminar", key="del_rut")
+            if del_rut and st.button("Eliminar", type="secondary", key="btn_del"):
+                before  = len(df)
+                df_new  = df[df["RUT"].astype(str) != del_rut.strip()]
+                st.session_state["repo"] = df_new
+                try:
+                    df_new.to_csv(REPO_FILE, index=False)
+                except Exception:
+                    pass
+                st.warning(f"Eliminados {before - len(df_new)} registros del RUT {del_rut}")
+                st.rerun()
 
 
 if __name__ == "__main__":
