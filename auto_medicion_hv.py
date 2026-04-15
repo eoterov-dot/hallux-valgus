@@ -26,80 +26,76 @@ try:
 except ImportError:
     COORDS_OK = False
 
+# OCR: intentamos ocrmac (Vision de macOS, sin dependencias externas)
+# y pytesseract como alternativa.
 try:
-    import pytesseract
-    OCR_OK = True
+    from ocrmac import OCR as _MacOCR
+    OCR_ENGINE = "ocrmac"
+    OCR_OK     = True
 except ImportError:
-    OCR_OK = False
+    try:
+        import pytesseract as _tess
+        OCR_ENGINE = "tesseract"
+        OCR_OK     = True
+    except ImportError:
+        OCR_ENGINE = None
+        OCR_OK     = False
 
 # ══════════════════════════════════════════════════════════════
 # OCR — EXTRACCIÓN DE DATOS DESDE LA RADIOGRAFÍA
 # ══════════════════════════════════════════════════════════════
 
-def preprocess_for_ocr(pil_gray_crop: Image.Image) -> np.ndarray:
-    """
-    Preprocesa un recorte de la imagen para maximizar la legibilidad en Tesseract.
-    Maneja tanto texto blanco sobre negro (radiografías) como negro sobre blanco.
-    """
-    arr = np.array(pil_gray_crop)
-
-    # Invertir si el fondo es oscuro (texto blanco sobre negro)
-    if arr.mean() < 128:
-        arr = 255 - arr
-
-    # Mejorar contraste local con CLAHE
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    arr   = clahe.apply(arr)
-
-    # Escalar × 3 — Tesseract rinde mejor con fuentes grandes
-    arr = cv2.resize(arr, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-
-    # Desenfoque leve para eliminar ruido de píxeles
-    arr = cv2.GaussianBlur(arr, (3, 3), 0)
-
-    # Umbral de Otsu: binarización adaptativa sin parámetros manuales
-    _, arr = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    return arr
-
-
 def ocr_patient_info(img_pil: Image.Image):
     """
-    Extrae nombre y RUT/ID del texto DICOM superpuesto en la radiografía.
-    Busca en la esquina superior izquierda y superior derecha, que es donde
-    los sistemas PACS/DICOM ubican los datos del paciente.
-    Devuelve (nombre, rut) — puede ser (None, None) si no hay datos legibles.
+    Extrae nombre y RUT/ID del texto DICOM de la radiografía.
+    Usa ocrmac (Vision de macOS) o pytesseract como fallback.
+    Devuelve (nombre, rut) o (None, None).
     """
     if not OCR_OK:
         return None, None
 
     import re
     w, h = img_pil.size
-    gray = img_pil.convert("L")
-
-    # Cuatro zonas de búsqueda: izquierda arriba, derecha arriba,
-    # banda completa superior e inferior
-    crops = [
-        gray.crop((0,          0,        w // 2,      int(h * 0.15))),  # sup izq
-        gray.crop((w // 2,     0,        w,           int(h * 0.15))),  # sup der
-        gray.crop((0,          0,        w,           int(h * 0.15))),  # sup completo
-        gray.crop((0,          int(h * 0.88), w,      h)),              # inf completo
-    ]
 
     all_text = ""
-    for crop in crops:
-        arr = preprocess_for_ocr(crop)
-        for psm in [6, 4, 11]:   # distintos modos de segmentación de Tesseract
-            try:
-                txt = pytesseract.image_to_string(
-                    arr,
-                    config=f"--psm {psm} --oem 3 -c tessedit_char_whitelist="
-                           r"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-                           r"0123456789^-. /",
-                )
-                all_text += "\n" + txt
-            except Exception:
-                pass
+
+    if OCR_ENGINE == "ocrmac":
+        # ── Apple Vision (macOS nativo, sin instalaciones extra) ──
+        try:
+            import tempfile, os
+            # Guardar temporalmente para ocrmac
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+                tmp_path = tf.name
+            img_pil.crop((0, 0, w, int(h * 0.15))).save(tmp_path)
+            results = _MacOCR(tmp_path).recognize()
+            os.unlink(tmp_path)
+            # results = [(text, confidence, bbox), ...]
+            all_text = "\n".join(r[0] for r in results)
+        except Exception:
+            all_text = ""
+
+    else:
+        # ── pytesseract (necesita brew install tesseract) ─────────
+        import pytesseract as _tess
+        gray = img_pil.convert("L")
+        crops = [
+            gray.crop((0,      0,        w // 2, int(h * 0.15))),
+            gray.crop((w // 2, 0,        w,      int(h * 0.15))),
+            gray.crop((0,      0,        w,      int(h * 0.15))),
+        ]
+        for crop in crops:
+            arr = np.array(crop)
+            if arr.mean() < 128:
+                arr = 255 - arr
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            arr   = clahe.apply(arr)
+            arr   = cv2.resize(arr, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+            _, arr = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            for psm in [6, 4, 11]:
+                try:
+                    all_text += "\n" + _tess.image_to_string(arr, config=f"--psm {psm} --oem 3")
+                except Exception:
+                    pass
 
     nombre, rut = None, None
 
@@ -109,13 +105,26 @@ def ocr_patient_info(img_pil: Image.Image):
             continue
 
         # ── Nombre: formato DICOM "APELLIDO^NOMBRE" ──────────
-        if "^" in line and not nombre:
-            parts = line.split("^", 1)
-            ap   = parts[0].strip()
-            nom  = parts[1].strip() if len(parts) > 1 else ""
+        # Tesseract 4 suele leer "^" como "-~", "~", "^~" u otras variantes.
+        # Probamos todos los separadores conocidos.
+        separadores = ["^", "-~", "^~", "~", " - "]
+        sep_usado   = next((s for s in separadores if s in line), None)
+
+        if sep_usado and not nombre:
+            parts = line.split(sep_usado, 1)
+            ap    = re.sub(r"[^A-ZÁÉÍÓÚÑ ]", "", parts[0]).strip()
+            nom   = re.sub(r"[^A-ZÁÉÍÓÚÑ ]", "", parts[1]).strip() if len(parts) > 1 else ""
             candidate = f"{ap} {nom}".strip()
             if len(candidate) >= 6 and re.search(r"[A-Z]{3,}", candidate):
                 nombre = candidate[:80]
+
+        # ── Fallback: línea larga de solo mayúsculas = nombre ─
+        if not nombre:
+            solo_mayus = re.sub(r"[^A-ZÁÉÍÓÚÑ ]", "", line).strip()
+            if len(solo_mayus) >= 10 and solo_mayus == solo_mayus.upper():
+                palabras = [p for p in solo_mayus.split() if len(p) >= 3]
+                if len(palabras) >= 3:
+                    nombre = " ".join(palabras)[:80]
 
         # ── RUT chileno con puntos: 12.345.678-9 ─────────────
         if not rut:
