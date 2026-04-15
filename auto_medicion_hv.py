@@ -186,7 +186,7 @@ def pca_axis(pts: np.ndarray):
     return mean, vecs[:, 0], elong, vals
 
 
-def extract_bones(mask: np.ndarray, min_area_frac=0.001, min_elong=2.5):
+def extract_bones(mask: np.ndarray, min_area_frac=0.001, min_elong=2.0):
     """
     Detecta estructuras óseas elongadas con tres filtros calibrados:
 
@@ -208,9 +208,9 @@ def extract_bones(mask: np.ndarray, min_area_frac=0.001, min_elong=2.5):
 
         bw = stats[i, cv2.CC_STAT_WIDTH]
         bh = stats[i, cv2.CC_STAT_HEIGHT]
-        # Umbral bajo (1.2) porque un hueso inclinado 45° tiene bbox cuadrado
-        # aunque su elongación real sea alta. La elongación PCA filtra mejor.
-        if max(bw, bh) / (min(bw, bh) + 1) < 1.2: continue
+        # NO se filtra por bounding-box AR: un hueso inclinado 45° tiene
+        # bbox cuadrado (AR=1.0) aunque sea muy elongado. El PCA calcula
+        # la elongación real y es el único filtro de forma que usamos.
 
         ys, xs = np.where(labels == i)
         pts = np.stack([xs, ys], axis=1).astype(np.float64)
@@ -220,8 +220,11 @@ def extract_bones(mask: np.ndarray, min_area_frac=0.001, min_elong=2.5):
         if elong < min_elong: continue
 
         # Rechaza solo estructuras casi puramente horizontales (texto cabecera).
-        # Umbral 0.82 = permite ángulos hasta ~55° desde la vertical.
-        if abs(axis[0]) >= 0.82:
+        # Umbral 0.90 = permite ángulos hasta ~64° desde la vertical.
+        # Necesario porque en HV severo la falange del hallux puede estar
+        # a 50-60° de la vertical. El texto de la placa está a <10° de la
+        # horizontal (>80° de la vertical) → sigue siendo rechazado.
+        if abs(axis[0]) >= 0.90:
             continue
 
         proj   = (pts - center) @ axis
@@ -293,14 +296,42 @@ def confidence_score(b1, b2) -> float:
     return round(min(1.0, (b1["elongation"] + b2["elongation"]) / 16.0), 2)
 
 
+def bone_endpoints(bone):
+    """
+    Devuelve (extremo_distal, extremo_proximal) de un hueso.
+    Distal  = extremo con y MÁS PEQUEÑO  (hacia los dedos, arriba en la imagen).
+    Proximal = extremo con y MÁS GRANDE  (hacia el talón, abajo en la imagen).
+    """
+    c  = np.array(bone["center"])
+    a  = np.array(bone["axis"])
+    hl = bone["length"] / 2
+    e1, e2 = c + a * hl, c - a * hl
+    if e1[1] < e2[1]:
+        return e1, e2   # e1 = distal (menor y)
+    return e2, e1       # e2 = distal
+
+
 def measure_angles(meta: list, phal: list) -> dict:
+    """
+    Calcula AHV, AIM 1-2 y AIM 2-5.
+
+    Para AHV: busca la falange cuya BASE PROXIMAL está más cerca de la
+    CABEZA DISTAL de MT1.  Esto es anatómicamente correcto porque la
+    falange proximal del hallux articula con la cabeza del 1er metatarsiano
+    en la articulación MTF1.  Funciona correctamente incluso en HV severo
+    donde el centro de la falange está desplazado lateralmente respecto a MT1.
+    """
     results = {}
 
     if len(meta) >= 1 and len(phal) >= 1:
         mt1 = meta[0]
-        # PF para AHV = falange con x más cercana a MT1
-        # (la falange del hallux siempre está en la misma columna que MT1)
-        pf1 = min(phal, key=lambda p: abs(p["center"][0] - mt1["center"][0]))
+        mt1_head, _ = bone_endpoints(mt1)   # cabeza distal de MT1
+
+        def dist_base_to_mt1_head(pf):
+            _, pf_base = bone_endpoints(pf)  # base proximal de la falange
+            return float(np.linalg.norm(pf_base - mt1_head))
+
+        pf1 = min(phal, key=dist_base_to_mt1_head)
         results["AHV"] = {
             "angle":      angle_between(mt1["axis"], pf1["axis"]),
             "bone1":      mt1,
@@ -520,8 +551,8 @@ def main():
         st.markdown("---")
         min_elong = st.slider(
             "Elongación mínima de hueso",
-            min_value=1.5, max_value=6.0, value=2.5, step=0.1,
-            help="2.5 recomendado. Sube si detecta ruido; baja si no encuentra huesos.",
+            min_value=1.5, max_value=6.0, value=2.0, step=0.1,
+            help="2.0 recomendado. Sube si detecta ruido; baja si no encuentra huesos.",
         )
         st.markdown("---")
         st.markdown("### 📋 Rangos normales")
